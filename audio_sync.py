@@ -19,10 +19,13 @@ SOCKET_PATH = "/tmp/silverblue_led.sock"
 
 SAMPLE_RATE = 44100 
 BLOCK_SIZE = 2048
-MAX_BRIGHTNESS = 0.7 
+# Configuração de Brilho
+MIN_BRIGHTNESS = 0.2       # Silêncio não é breu (20%)
+MAX_AUDIO_BRIGHTNESS = 0.7 # Máximo para música (70%)
+PING_BRIGHTNESS = 1.0      # Pings explodem em 100%
 
 # --- Paletas por Vibe ---
-PALETTES_CHILL = [[0.5, 0.55, 0.6], [0.0, 0.05, 0.1], [0.25, 0.3, 0.35]]
+PALETTES_CHILL = [[0.5, 0.55, 0.6], [0.1, 0.15, 0.9], [0.08, 0.6, 1.0]] # Ocean, Tungsten Warm, Candle
 PALETTES_PARTY = [[0.8, 0.9, 0.0], [0.4, 0.5, 0.6], [0.1, 0.5, 0.9]]
 PALETTES_RAGE  = [[0.0, 0.02, 0.98], [0.0, 0.0, 0.0]]
 
@@ -154,14 +157,16 @@ class AudioReactive:
         freqs = np.fft.rfftfreq(len(indata), 1/SAMPLE_RATE)
         
         mask_bass = (freqs > 40) & (freqs < 150)
-        mask_mid  = (freqs > 200) & (freqs < 3000)
+        mask_mid  = (freqs > 250) & (freqs < 4000) # Resolução ampliada para instrumentos de frente
         e_bass = np.sum(fft_data[mask_bass]) if np.any(mask_bass) else 0
+        e_mid  = np.sum(fft_data[mask_mid]) if np.any(mask_mid) else 0
         
         self.avg_bass = (self.avg_bass * 0.99) + (e_bass * 0.01)
         bass_ratio = e_bass / max(self.avg_bass, 0.1)
         
         current_mode = self.vibe.analyze(indata, bass_ratio)
         
+        # Parâmetros por modo
         if current_mode == "RAGE":
             red_priority = True; pastel_mode = False
         elif current_mode == "PARTY":
@@ -169,38 +174,45 @@ class AudioReactive:
         else: 
             red_priority = False; pastel_mode = False
 
-        if bass_ratio < 0.5:
-            target_bri = 0.1 
+        # LÓGICA INVERSA (Ducking): Brilho cai com o pulso
+        # Silêncio = MAX_AUDIO_BRIGHTNESS (0.7)
+        # Pulso forte = Redução em direção a MIN_BRIGHTNESS (0.2)
+        
+        if bass_ratio < 0.4:
+            target_bri = MAX_AUDIO_BRIGHTNESS
             self.red_channel = 0.0
             self.target_sat = 1.0
         else:
-            norm = (bass_ratio - 0.5) / 2.0 
-            target_bri = 0.1 + (np.clip(norm, 0, 1.0) ** 2.0 * 0.9)
-            if red_priority and target_bri > 0.4: self.red_channel = (target_bri - 0.4) * 2.0 
-            else: self.red_channel = 0.0
+            # Quanto maior o bass_ratio, maior a redução
+            reduction = np.clip((bass_ratio - 0.4) / 2.0, 0, 1.0) ** 1.5
+            target_bri = MAX_AUDIO_BRIGHTNESS - (reduction * (MAX_AUDIO_BRIGHTNESS - MIN_BRIGHTNESS))
+            
+            if red_priority and bass_ratio > 1.2: 
+                self.red_channel = (bass_ratio - 1.2) * 0.5
+            else: 
+                self.red_channel = 0.0
+                
             if pastel_mode:
-                sat_drop = np.clip(norm * 0.7, 0.0, 0.7)
+                sat_drop = np.clip(reduction * 0.5, 0.0, 0.5)
                 self.target_sat = 1.0 - sat_drop
-            else: self.target_sat = 1.0
+            else: 
+                self.target_sat = 1.0
 
-        if target_bri > self.peak_hold: self.peak_hold = target_bri 
-        else: self.peak_hold = max(self.peak_hold - 0.05, 0)
-        
-        # SCALING: Comprime 0-100% para 0-MAX_BRIGHTNESS
-        # Isso mantém a dinâmica dos picos, apenas num volume menor
-        scaled_brightness = min(max(target_bri, self.peak_hold), 1.0) * MAX_BRIGHTNESS
-        self.target_brightness = scaled_brightness
+        self.target_brightness = np.clip(target_bri, MIN_BRIGHTNESS, MAX_AUDIO_BRIGHTNESS)
 
-        if self.target_brightness < (0.2 * MAX_BRIGHTNESS) and np.any(mask_mid):
+        # Cor baseada nos instrumentos de frente (Mid/High)
+        if np.any(mask_mid):
              valid_fft = fft_data[mask_mid]; valid_freqs = freqs[mask_mid]
              centroid = np.sum(valid_freqs * valid_fft) / (np.sum(valid_fft) + 1e-6)
-             harmonic_pos = np.clip((centroid - 200) / 2800, 0.0, 1.0)
+             # Escala logarítmica para melhor percepção de instrumentos (evitando log10(0))
+             centroid_safe = max(centroid, 250)
+             harmonic_pos = np.clip((np.log10(centroid_safe) - np.log10(250)) / (np.log10(4000) - np.log10(250)), 0.0, 1.0)
              raw_hue = self.get_color_from_vibe(harmonic_pos)
              self.hue_stack.append(raw_hue)
-             if len(self.hue_stack) > 20: self.hue_stack.pop(0)
+             if len(self.hue_stack) > 15: self.hue_stack.pop(0)
              self.target_hue = sum(self.hue_stack) / len(self.hue_stack)
 
-        if (time.time() - self.palette_timer > 60.0) and (self.target_brightness < 0.2):
+        if (time.time() - self.palette_timer > 60.0) and (bass_ratio < 0.3):
             self.current_palette_idx += 1; self.palette_timer = time.time()
 
     def audio_callback(self, indata, frames, time_info, status):
@@ -219,34 +231,30 @@ class AudioReactive:
         rgb = COLORS.get(color_name.strip().lower(), (0, 255, 0))
         white = (255, 255, 255)
         
+        # Pings sempre a 100% (PING_BRIGHTNESS)
+        p_bri = PING_BRIGHTNESS
+
         if self.led:
-            # Padrão: Flash-Flash (pausa) Flash-Flash (pausa) CORRRRRRR
-            
-            # --- PARTE 1: Strobe (2 ciclos de double-tap) ---
+            # --- PARTE 1: Strobe ---
             for _ in range(2): 
-                # Tap 1
-                await self.led.set_rgb(white); await asyncio.sleep(0.04)
+                await self.led.set_rgb([int(x * p_bri) for x in white]); await asyncio.sleep(0.04)
                 await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.06)
-                # Tap 2
-                await self.led.set_rgb(white); await asyncio.sleep(0.04)
-                await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.25) # Pausa entre grupos
+                await self.led.set_rgb([int(x * p_bri) for x in white]); await asyncio.sleep(0.04)
+                await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.25)
             
             await asyncio.sleep(0.1)
             
-            # --- PARTE 2: A Cor (Entrada Rápida, Hold Longo) ---
-            # Fade In Express (0.2s)
+            # --- PARTE 2: A Cor ---
             for i in range(0, 101, 20): 
-                factor = i / 100.0
+                factor = (i / 100.0) * p_bri
                 r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
                 await self.led.set_rgb((r, g, b))
                 await asyncio.sleep(0.03)
             
-            # Hold (2.1s)
             await asyncio.sleep(2.1)
             
-            # Fade Out (0.5s)
             for i in range(100, -1, -10):
-                factor = i / 100.0
+                factor = (i / 100.0) * p_bri
                 r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
                 await self.led.set_rgb((r, g, b))
                 await asyncio.sleep(0.05)
