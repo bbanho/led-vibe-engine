@@ -208,30 +208,50 @@ class AudioReactive:
         except: pass
 
     async def handle_ping(self, color_name):
-        print(f"📩 PING: {color_name}")
+        print(f"📩 PING: {color_name} (Strobe Double-Tap + Long Color)")
         self.override_mode = True
         
         COLORS = {
             "green": (0, 255, 0), "red": (255, 0, 0), "blue": (0, 0, 255),
             "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 200, 0),
-            "white": (255, 255, 255)
+            "white": (255, 255, 255), "wine": (100, 0, 20)
         }
         rgb = COLORS.get(color_name.strip().lower(), (0, 255, 0))
+        white = (255, 255, 255)
         
         if self.led:
-            for _ in range(2):
-                for i in range(0, 101, 20):
-                    factor = i / 100.0
-                    r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
-                    await self.led.set_rgb((r, g, b))
-                    await asyncio.sleep(0.05)
-                await asyncio.sleep(0.4)
-                for i in range(100, -1, -20):
-                    factor = i / 100.0
-                    r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
-                    await self.led.set_rgb((r, g, b))
-                    await asyncio.sleep(0.05)
-                await asyncio.sleep(0.2)
+            # Padrão: Flash-Flash (pausa) Flash-Flash (pausa) CORRRRRRR
+            
+            # --- PARTE 1: Strobe (2 ciclos de double-tap) ---
+            for _ in range(2): 
+                # Tap 1
+                await self.led.set_rgb(white); await asyncio.sleep(0.04)
+                await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.06)
+                # Tap 2
+                await self.led.set_rgb(white); await asyncio.sleep(0.04)
+                await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.25) # Pausa entre grupos
+            
+            await asyncio.sleep(0.1)
+            
+            # --- PARTE 2: A Cor (Entrada Rápida, Hold Longo) ---
+            # Fade In Express (0.2s)
+            for i in range(0, 101, 20): 
+                factor = i / 100.0
+                r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
+                await self.led.set_rgb((r, g, b))
+                await asyncio.sleep(0.03)
+            
+            # Hold (2.1s)
+            await asyncio.sleep(2.1)
+            
+            # Fade Out (0.5s)
+            for i in range(100, -1, -10):
+                factor = i / 100.0
+                r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
+                await self.led.set_rgb((r, g, b))
+                await asyncio.sleep(0.05)
+
+            await self.led.set_rgb((0,0,0)) 
             await asyncio.sleep(0.5)
         
         self.override_mode = False
