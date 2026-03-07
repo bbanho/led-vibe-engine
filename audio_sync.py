@@ -8,334 +8,233 @@ import random
 import socket
 import os
 import signal
-import argparse
 from bleak import BleakScanner, BleakClient
 
 # --- Configurações ---
 DEVICE_ADDRESS = "C5:50:EB:E3:E5:D0" 
-DEVICE_NAME_FILTER = "Triones" 
-AUDIO_DEVICE_ID = None 
 SOCKET_PATH = "/tmp/silverblue_led.sock"
-
 SAMPLE_RATE = 44100 
 BLOCK_SIZE = 2048
-# Configuração de Brilho
-MIN_BRIGHTNESS = 0.2       # Silêncio não é breu (20%)
-MAX_AUDIO_BRIGHTNESS = 0.7 # Máximo para música (70%)
-PING_BRIGHTNESS = 1.0      # Pings explodem em 100%
 
-# --- Paletas por Vibe ---
-PALETTES_CHILL = [[0.5, 0.55, 0.6], [0.1, 0.15, 0.9], [0.08, 0.6, 1.0]] # Ocean, Tungsten Warm, Candle
-PALETTES_PARTY = [[0.8, 0.9, 0.0], [0.4, 0.5, 0.6], [0.1, 0.5, 0.9]]
-PALETTES_RAGE  = [[0.0, 0.02, 0.98], [0.0, 0.0, 0.0]]
+# Configuração de Brilho e Cor
+MIN_BRIGHTNESS = 0.2       
+MAX_AUDIO_BRIGHTNESS = 0.7 
+PING_BRIGHTNESS = 1.0      
+SILENCE_THRESHOLD = 0.01   
+READING_HUE = 0.13         
+READING_SAT = 0.8          
+
+# --- Paletas Dinâmicas ---
+PALETTES = {
+    "CHILL": [[0.5, 0.55, 0.6], [0.1, 0.15, 0.9], [0.08, 0.6, 1.0]],
+    "PARTY": [[0.8, 0.9, 0.0], [0.4, 0.5, 0.6], [0.1, 0.5, 0.9]],
+    "RAGE":  [[0.0, 0.02, 0.98], [0.0, 0.0, 0.0]],
+    "WARM_COLD": [0.0, 0.12, 0.66],
+    "VAPORWAVE": [0.85, 0.75, 0.5],
+    "ROCK": [0.6, 0.15, 0.0],
+    "JAZZ": [0.08, 0.1, 0.05],
+    "TECHNO": [0.5, 0.33, 0.85],
+    "LOFI": [0.75, 0.1, 0.08]
+}
 
 class VibeEngine:
     def __init__(self):
         self.onsets = []
-        self.current_vibe = "CHILL"
+        self.current_vibe = "JAZZ"
         self.last_switch = 0
     
-    def analyze(self, indata, energy_ratio):
+    def analyze(self, energy_ratio):
         now = time.time()
         if energy_ratio > 1.5:
             self.onsets = [t for t in self.onsets if now - t < 5.0]
             if not self.onsets or (now - self.onsets[-1] > 0.1): self.onsets.append(now)
-        
         density = len(self.onsets) / 5.0
-        
         if now - self.last_switch > 10.0:
-            new_vibe = self.current_vibe
-            if density > 4.0: new_vibe = "RAGE"
-            elif density > 1.0: new_vibe = "PARTY"
-            else: new_vibe = "CHILL"
-            
-            if new_vibe != self.current_vibe:
-                print(f"\n🧠 Vibe Shift: {self.current_vibe} -> {new_vibe} (Dens: {density:.1f})")
-                self.current_vibe = new_vibe
-                self.last_switch = now
+            if density > 4.0: self.current_vibe = "RAGE"
+            elif density > 1.0: self.current_vibe = "PARTY"
+            else: self.current_vibe = "JAZZ"
+            self.last_switch = now
         return self.current_vibe
 
 class LEDBLE:
     def __init__(self, device):
         self.device = device
-        self.client = None
+        self.client = BleakClient(device)
 
     async def connect(self):
-        if self.client and self.client.is_connected: return
-        self.client = BleakClient(self.device)
-        await self.client.connect()
-
-    async def disconnect(self):
-        if self.client and self.client.is_connected:
-            print("🔌 Desconectando LED para liberar recurso...")
-            await self.client.disconnect()
+        if not self.client.is_connected: await self.client.connect()
 
     async def set_rgb(self, rgb):
-        r, g, b = rgb
-        packet = [0x56, r, g, b, 0x00, 0xF0, 0xAA]
-        await self.send_bytes(packet)
-    
-    async def turn_on(self): await self.send_bytes([0xCC, 0x23, 0x33])
-
-    async def send_bytes(self, data):
-        if not self.client or not self.client.is_connected: await self.connect()
-        try: await self.client.write_gatt_char("0000ffe9-0000-1000-8000-00805f9b34fb", bytearray(data), response=False)
-        except: await self.connect(); await self.client.write_gatt_char("0000ffe9-0000-1000-8000-00805f9b34fb", bytearray(data), response=False)
+        try:
+            if not self.client.is_connected: await self.connect()
+            packet = [0x56, rgb[0], rgb[1], rgb[2], 0x00, 0xF0, 0xAA]
+            await self.client.write_gatt_char("0000ffe9-0000-1000-8000-00805f9b34fb", bytearray(packet), response=False)
+        except: pass
 
 class AudioReactive:
     def __init__(self):
         self.led = None
         self.running = True
         self.vibe = VibeEngine()
+        self.ping_lock = asyncio.Lock()
+        self.static_mode = False
+        self.override_mode = False
         
-        self.current_brightness = 0.0
-        self.target_brightness = 0.0
-        self.current_hue = 0.0
-        self.target_hue = 0.0
-        self.current_sat = 1.0
-        self.target_sat = 1.0
+        self.target_brightness = MIN_BRIGHTNESS
+        self.target_hue = READING_HUE
+        self.target_sat = READING_SAT
+        self.current_brightness = MIN_BRIGHTNESS
+        self.current_hue = READING_HUE
+        self.current_sat = READING_SAT
         
-        self.current_palette_idx = 0
-        self.palette_timer = time.time()
         self.avg_bass = 10.0
         self.peak_hold = 0.0
-        self.hue_stack = []
-        self.last_flash_time = 0
-        self.red_channel = 0.0
-        
-        self.override_mode = False
-
-    async def connect(self):
-        print(f"🔍 Conectando a {DEVICE_ADDRESS}...")
-        try:
-            # Tenta desconectar qualquer sessão zumbi anterior
-            device = await BleakScanner.find_device_by_address(DEVICE_ADDRESS, timeout=5.0)
-            if not device: await asyncio.sleep(20); return False
-            self.led = LEDBLE(device)
-            # Tenta um disconnect preventivo caso o objeto persista
-            try: await self.led.disconnect()
-            except: pass
-            
-            await asyncio.sleep(1.0) # Breve pausa para o hardware respirar
-            
-            try: await self.led.update()
-            except: pass
-            await self.led.turn_on()
-            print(f"✅ Conectado: {device.name}")
-            return True
-        except: await asyncio.sleep(5); return False
-
-    async def shutdown(self):
-        print("\n🛑 Encerrando serviço...")
-        self.running = False
-        if self.led:
-            try:
-                # Apaga o LED antes de sair
-                await self.led.set_rgb((0, 0, 0))
-                await asyncio.sleep(0.1)
-                await self.led.disconnect()
-                print("🔌 Desconectado com sucesso.")
-            except: pass
-        
-        if os.path.exists(SOCKET_PATH): os.remove(SOCKET_PATH)
-        print("👋 Tchau!")
-        asyncio.get_event_loop().stop()
-
-    def get_color_from_vibe(self, intensity):
-        if self.vibe.current_vibe == "RAGE": palettes = PALETTES_RAGE
-        elif self.vibe.current_vibe == "PARTY": palettes = PALETTES_PARTY
-        else: palettes = PALETTES_CHILL
-        palette = palettes[self.current_palette_idx % len(palettes)]
-        if intensity < 0.33: return palette[0]
-        elif intensity < 0.66: return palette[1]
-        else: return palette[2]
+        self.weather_accumulator = 0.0
 
     def process_audio(self, indata):
-        if self.override_mode: return
+        if self.override_mode or self.static_mode: return
 
         fft_data = np.abs(np.fft.rfft(indata[:, 0]))
         freqs = np.fft.rfftfreq(len(indata), 1/SAMPLE_RATE)
         
-        mask_bass = (freqs > 40) & (freqs < 150)
-        mask_mid  = (freqs > 250) & (freqs < 4000) # Resolução ampliada para instrumentos de frente
-        e_bass = np.sum(fft_data[mask_bass]) if np.any(mask_bass) else 0
-        e_mid  = np.sum(fft_data[mask_mid]) if np.any(mask_mid) else 0
+        e_bass = np.sum(fft_data[(freqs > 40) & (freqs < 150)])
+        rms = np.sqrt(np.mean(indata**2))
         
+        if rms < SILENCE_THRESHOLD:
+            self.target_brightness, self.target_hue, self.target_sat = MIN_BRIGHTNESS, READING_HUE, READING_SAT
+            return
+
         self.avg_bass = (self.avg_bass * 0.99) + (e_bass * 0.01)
         bass_ratio = e_bass / max(self.avg_bass, 0.1)
         
-        current_mode = self.vibe.analyze(indata, bass_ratio)
-        
-        # Parâmetros por modo
-        if current_mode == "RAGE":
-            red_priority = True; pastel_mode = False
-        elif current_mode == "PARTY":
-            red_priority = False; pastel_mode = True
-        else: 
-            red_priority = False; pastel_mode = False
+        mode = self.vibe.current_vibe
+        if mode in ["JAZZ", "PARTY", "RAGE", "DYNAMIC"]: mode = self.vibe.analyze(bass_ratio)
 
-        # LÓGICA INVERSA (Ducking): Brilho cai com o pulso
-        # Silêncio = MAX_AUDIO_BRIGHTNESS (0.7)
-        # Pulso forte = Redução em direção a MIN_BRIGHTNESS (0.2)
-        
-        if bass_ratio < 0.4:
-            target_bri = MAX_AUDIO_BRIGHTNESS
-            self.red_channel = 0.0
-            self.target_sat = 1.0
-        else:
-            # Quanto maior o bass_ratio, maior a redução
-            reduction = np.clip((bass_ratio - 0.4) / 2.0, 0, 1.0) ** 1.5
-            target_bri = MAX_AUDIO_BRIGHTNESS - (reduction * (MAX_AUDIO_BRIGHTNESS - MIN_BRIGHTNESS))
-            
-            if red_priority and bass_ratio > 1.2: 
-                self.red_channel = (bass_ratio - 1.2) * 0.5
-            else: 
-                self.red_channel = 0.0
-                
-            if pastel_mode:
-                sat_drop = np.clip(reduction * 0.5, 0.0, 0.5)
-                self.target_sat = 1.0 - sat_drop
-            else: 
-                self.target_sat = 1.0
+        if mode == "KCD2":
+            e_rain = np.sum(fft_data[(freqs > 2000) & (freqs < 8000)])
+            detected_wet = e_rain > (self.avg_bass * 1.5) and e_rain > 0.5
+            if detected_wet: self.weather_accumulator = min(1.0, self.weather_accumulator + 0.05)
+            else: self.weather_accumulator = max(0.0, self.weather_accumulator - 0.02)
+            is_wet = self.weather_accumulator > 0.5
+            e_steel = np.sum(fft_data[freqs > 4000])
+            e_hooves = np.sum(fft_data[(freqs >= 60) & (freqs < 200)])
+            e_thunder = np.sum(fft_data[freqs < 60])
+            if e_steel > (self.avg_bass * 6.0) and e_steel > 0.6:
+                self.target_hue, self.target_sat, self.target_brightness = 0.6, 0.1, 1.0
+                return
+            elif e_hooves > (self.avg_bass * 1.5):
+                self.target_hue, self.target_sat, self.target_brightness = 0.05, 0.8, MIN_BRIGHTNESS + 0.3
+                return
+            else:
+                self.target_hue, self.target_sat = (0.55, 0.3) if is_wet else (0.08, 0.9)
+                thunder_mod = (np.sin(time.time() * 15) * 0.1) if e_thunder > (self.avg_bass * 2.0) else 0
+                self.target_brightness = np.clip(MIN_BRIGHTNESS + thunder_mod + (random.uniform(-0.03, 0.03) if is_wet else 0), 0, 1.0)
+            return
 
-        self.target_brightness = np.clip(target_bri, MIN_BRIGHTNESS, MAX_AUDIO_BRIGHTNESS)
-
-        # Cor baseada nos instrumentos de frente (Mid/High)
-        if np.any(mask_mid):
-             valid_fft = fft_data[mask_mid]; valid_freqs = freqs[mask_mid]
-             centroid = np.sum(valid_freqs * valid_fft) / (np.sum(valid_fft) + 1e-6)
-             # Escala logarítmica para melhor percepção de instrumentos (evitando log10(0))
-             centroid_safe = max(centroid, 250)
-             harmonic_pos = np.clip((np.log10(centroid_safe) - np.log10(250)) / (np.log10(4000) - np.log10(250)), 0.0, 1.0)
-             raw_hue = self.get_color_from_vibe(harmonic_pos)
-             self.hue_stack.append(raw_hue)
-             if len(self.hue_stack) > 15: self.hue_stack.pop(0)
-             self.target_hue = sum(self.hue_stack) / len(self.hue_stack)
-
-        if (time.time() - self.palette_timer > 60.0) and (bass_ratio < 0.3):
-            self.current_palette_idx += 1; self.palette_timer = time.time()
-
-    def audio_callback(self, indata, frames, time_info, status):
-        try: self.process_audio(indata)
-        except: pass
-
-    async def handle_ping(self, color_name):
-        print(f"📩 PING: {color_name} (Strobe Double-Tap + Long Color)")
-        self.override_mode = True
-        
-        COLORS = {
-            "green": (0, 255, 0), "red": (255, 0, 0), "blue": (0, 0, 255),
-            "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 200, 0),
-            "white": (255, 255, 255), "wine": (100, 0, 20)
+        SCAPES = {
+            "WAR_ZONE": {
+                "ambient": (0.33, 1.0), "events": [(2000, 20000, 3.0, 0.0, 0.0, 1.0), (0, 200, 3.0, 0.03, 1.0, 0.8)]
+            }
         }
-        rgb = COLORS.get(color_name.strip().lower(), (0, 255, 0))
-        white = (255, 255, 255)
-        
-        # Pings sempre a 100% (PING_BRIGHTNESS)
-        p_bri = PING_BRIGHTNESS
+        if mode in SCAPES:
+            s = SCAPES[mode]
+            self.target_hue, self.target_sat = s["ambient"]
+            self.target_brightness = MIN_BRIGHTNESS + (bass_ratio * 0.2)
+            for fmin, fmax, thr, h, sat, bri in s["events"]:
+                e_val = np.sum(fft_data[(freqs > fmin) & (freqs < fmax)])
+                if e_val > (self.avg_bass * thr):
+                    self.target_hue, self.target_sat, self.target_brightness = h, sat, bri
+                    break
+            return
 
-        if self.led:
-            # --- PARTE 1: Strobe ---
-            for _ in range(2): 
-                await self.led.set_rgb([int(x * p_bri) for x in white]); await asyncio.sleep(0.04)
-                await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.06)
-                await self.led.set_rgb([int(x * p_bri) for x in white]); await asyncio.sleep(0.04)
-                await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.25)
-            
-            await asyncio.sleep(0.1)
-            
-            # --- PARTE 2: A Cor ---
-            for i in range(0, 101, 20): 
-                factor = (i / 100.0) * p_bri
-                r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
-                await self.led.set_rgb((r, g, b))
-                await asyncio.sleep(0.03)
-            
-            await asyncio.sleep(2.1)
-            
-            for i in range(100, -1, -10):
-                factor = (i / 100.0) * p_bri
-                r, g, b = int(rgb[0]*factor), int(rgb[1]*factor), int(rgb[2]*factor)
-                await self.led.set_rgb((r, g, b))
-                await asyncio.sleep(0.05)
-
-            await self.led.set_rgb((0,0,0)) 
-            await asyncio.sleep(0.5)
-        
-        self.override_mode = False
+        self.target_brightness = MIN_BRIGHTNESS + (np.clip((bass_ratio - 0.5) / 2.0, 0, 1) * (MAX_AUDIO_BRIGHTNESS - MIN_BRIGHTNESS))
+        if mode in ["WARM_COLD", "VAPORWAVE", "ROCK", "JAZZ", "TECHNO", "LOFI"]:
+            p = PALETTES[mode]
+            idx = int(np.clip(bass_ratio * 0.5 * 2.99, 0, 2)) if mode != "WARM_COLD" else int(np.clip(bass_ratio, 0, 2))
+            self.target_hue = p[idx % len(p)]
+            self.target_sat = 1.0 if mode != "LOFI" else 0.5
+        else:
+            if np.any((freqs > 250) & (freqs < 4000)):
+                mid_fft = fft_data[(freqs > 250) & (freqs < 4000)]
+                centroid = np.sum(freqs[(freqs > 250) & (freqs < 4000)] * mid_fft) / (np.sum(mid_fft) + 1e-6)
+                self.target_hue = np.clip((np.log10(max(centroid, 250)) - np.log10(250)) / (np.log10(4000) - np.log10(250)), 0, 1)
 
     async def led_control_loop(self):
-        print("💡 Loop LED iniciado...")
         while self.running:
-            if self.override_mode:
-                await asyncio.sleep(0.05); continue
-
+            if self.override_mode: await asyncio.sleep(0.05); continue
             if self.led:
+                if self.static_mode: self.target_brightness, self.target_hue, self.target_sat = MIN_BRIGHTNESS, READING_HUE, READING_SAT
+                if self.current_brightness <= (MIN_BRIGHTNESS + 0.01) and self.target_brightness > (MIN_BRIGHTNESS + 0.05):
+                    self.current_hue = self.target_hue
                 self.current_brightness = (self.current_brightness * 0.8) + (self.target_brightness * 0.2)
-                
                 diff = self.target_hue - self.current_hue
                 if diff > 0.5: diff -= 1.0
                 elif diff < -0.5: diff += 1.0
-                self.current_hue = (self.current_hue + (diff * 0.02)) % 1.0 
-                
+                speed = 0.05 if self.vibe.current_vibe in ["WAR_ZONE", "KCD2", "ROCK"] else 0.02
+                self.current_hue = (self.current_hue + (diff * speed)) % 1.0
                 self.current_sat = (self.current_sat * 0.8) + (self.target_sat * 0.2)
                 r, g, b = colorsys.hsv_to_rgb(self.current_hue, self.current_sat, self.current_brightness)
-                
-                if self.vibe.current_vibe == "RAGE":
-                    ducking = 1.0 - (self.red_channel * 0.8)
-                    r = r * ducking + (self.red_channel * self.current_brightness)
-                    g *= ducking; b *= ducking
-                
-                r, g, b = min(1.0, r), min(1.0, g), min(1.0, b)
-                if self.current_brightness < 0.02: r, g, b = 0, 0, 0
-
-                try: await self.led.set_rgb((int(r*255), int(g*255), int(b*255)))
-                except: pass
-            
+                await self.led.set_rgb((int(r*255), int(g*255), int(b*255)))
             await asyncio.sleep(0.05)
-    
+
+    async def handle_ping(self, color_name):
+        async with self.ping_lock:
+            self.override_mode = True
+            COLORS = { "green": (0, 255, 0), "red": (255, 0, 0), "blue": (0, 0, 255), "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 200, 0), "white": (255, 255, 255), "wine": (100, 0, 20) }
+            rgb = COLORS.get(color_name.lower(), (0, 255, 0))
+            if self.led:
+                for _ in range(2): 
+                    await self.led.set_rgb((255,255,255)); await asyncio.sleep(0.05); await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.1)
+                for i in range(0, 101, 20): 
+                    f = i/100.0; await self.led.set_rgb((int(rgb[0]*f), int(rgb[1]*f), int(rgb[2]*f))); await asyncio.sleep(0.03)
+                await asyncio.sleep(2.0)
+                await self.led.set_rgb((0,0,0)); await asyncio.sleep(0.5)
+            self.override_mode = False
+
     async def server_loop(self):
         if os.path.exists(SOCKET_PATH): os.remove(SOCKET_PATH)
         server = await asyncio.start_unix_server(self.handle_client, SOCKET_PATH)
-        print(f"👂 Socket server ativo: {SOCKET_PATH}")
         async with server: await server.serve_forever()
 
     async def handle_client(self, reader, writer):
-        data = await reader.read(100)
-        message = data.decode().strip()
-        if message.startswith("PING"):
-            parts = message.split(" ")
-            color = parts[1] if len(parts) > 1 else "green"
-            asyncio.create_task(self.handle_ping(color))
+        global READING_HUE, READING_SAT, MIN_BRIGHTNESS
+        data = await reader.read(100); msg = data.decode().strip()
+        if msg.startswith("PING"):
+            p = msg.split(" "); color = p[1] if len(p) > 1 else "green"; asyncio.create_task(self.handle_ping(color))
+        elif msg.startswith("MODE"):
+            p = msg.split(" "); m = p[1].upper() if len(p) > 1 else "JAZZ"
+            if m == "STATIC": self.static_mode = True
+            else: self.static_mode = False; self.vibe.current_vibe = m
+        elif msg.startswith("SET"):
+            p = msg.split(" ")
+            if len(p) >= 4:
+                try: READING_HUE, READING_SAT, MIN_BRIGHTNESS = float(p[1]), float(p[2]), float(p[3])
+                except: pass
         writer.close()
 
     async def main(self):
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
-
         asyncio.create_task(self.server_loop()) 
         while self.running:
-            if await self.connect():
-                try:
-                    target_id = None
-                    devices = sd.query_devices()
+            try:
+                device = await BleakScanner.find_device_by_address(DEVICE_ADDRESS, timeout=5.0)
+                if device:
+                    self.led = LEDBLE(device); await self.led.connect()
+                    target_id = None; devices = sd.query_devices()
                     for i, d in enumerate(devices):
-                        if "Easy Effects Sink" in d['name']: target_id = i; break
+                        # Mudança crítica: Procura por "Easy Effects Sink" ou "easyeffects_sink"
+                        name = d['name'].lower()
+                        if "easy effects" in name or "easyeffects" in name: target_id = i; break
                     if target_id is None: target_id = sd.default.device[0]
-                    dev_info = sd.query_devices(target_id, 'input')
-                    global SAMPLE_RATE; SAMPLE_RATE = int(dev_info['default_samplerate'])
-                    print(f"✅ Audio: {dev_info['name']}")
-                    
-                    stream = sd.InputStream(callback=self.audio_callback, device=target_id, channels=1, blocksize=BLOCK_SIZE, samplerate=SAMPLE_RATE)
-                    with stream: await self.led_control_loop()
-                except Exception as e: print(f"❌ Erro Loop: {e}")
-            
-            if self.running:
-                print("🔄 Reconectando...")
-                await asyncio.sleep(5)
+                    with sd.InputStream(callback=lambda d,f,t,s: self.process_audio(d), device=target_id, channels=1, samplerate=SAMPLE_RATE):
+                        await self.led_control_loop()
+            except: pass
+            await asyncio.sleep(5)
+
+    async def shutdown(self):
+        self.running = False
+        if self.led: await self.led.set_rgb((0,0,0))
+        if os.path.exists(SOCKET_PATH): os.remove(SOCKET_PATH)
+        os._exit(0)
 
 if __name__ == "__main__":
-    app = AudioReactive()
-    try: asyncio.run(app.main())
-    except KeyboardInterrupt: pass
+    asyncio.run(AudioReactive().main())
