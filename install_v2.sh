@@ -5,68 +5,95 @@ set -e
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+RED='\033[0;31m'
+NC='\033[0m'
 
-echo -e "${BLUE}🔧 Instalando Silverblue LED Controller (Vibe Engine)...${NC}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_NAME="led-vibe-engine"
+SERVICE_FILE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
 
-# 1. Setup Venv
+echo -e "${BLUE}🔧 Instalando LED Vibe Engine...${NC}"
+
+# 1. Remover serviços antigos conflitantes
+echo -e "${BLUE}🧹 Removendo serviços antigos...${NC}"
+for OLD in "audio-sync" "silverblue-led-vibe"; do
+    OLD_FILE="$HOME/.config/systemd/user/${OLD}.service"
+    if systemctl --user is-active --quiet "${OLD}.service" 2>/dev/null; then
+        systemctl --user stop "${OLD}.service"
+        echo -e "  ${YELLOW}Parado: ${OLD}.service${NC}"
+    fi
+    if systemctl --user is-enabled --quiet "${OLD}.service" 2>/dev/null; then
+        systemctl --user disable "${OLD}.service"
+        echo -e "  ${YELLOW}Desabilitado: ${OLD}.service${NC}"
+    fi
+    if [ -f "$OLD_FILE" ]; then
+        rm -f "$OLD_FILE"
+        echo -e "  ${RED}Removido: $OLD_FILE${NC}"
+    fi
+done
+
+# 2. Setup Venv
 echo -e "${BLUE}📦 Configurando Python Venv...${NC}"
-if [ ! -d ".venv" ]; then
-    python3 -m venv .venv
+if [ ! -d "$SCRIPT_DIR/.venv" ]; then
+    python3 -m venv "$SCRIPT_DIR/.venv"
 fi
-source .venv/bin/activate
+source "$SCRIPT_DIR/.venv/bin/activate"
+pip install --upgrade pip -q
+pip install -r "$SCRIPT_DIR/requirements.txt" -q
 
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# 2. Verificar Dependências de Sistema (PortAudio)
+# 3. Verificar dependências de sistema (PortAudio)
 echo -e "${BLUE}🔍 Verificando dependências de sistema...${NC}"
-if ! ldconfig -p | grep -q libportaudio; then
+if ! ldconfig -p 2>/dev/null | grep -q libportaudio; then
     echo -e "${YELLOW}⚠️  Aviso: 'libportaudio' não encontrado.${NC}"
-    echo "Necessário para 'sounddevice'. Instale com: rpm-ostree install portaudio"
+    echo "    Necessário para 'sounddevice'. Instale com: rpm-ostree install portaudio"
 fi
 
-# 3. Wrapper Script
-echo -e "${BLUE}📝 Atualizando Wrapper (~/.script/run_led.sh)...${NC}"
+# 4. Wrapper script
+echo -e "${BLUE}📝 Configurando wrapper (~/.script/run_led.sh)...${NC}"
 mkdir -p "$HOME/.script"
 cat > "$HOME/.script/run_led.sh" <<EOF
 #!/bin/bash
-# Wrapper para Silverblue LED Controller
-# Uso: 
-#   ./run_led.sh          -> Inicia Daemon (Vibe Engine)
-#   ./run_led.sh blue     -> Envia Ping Azul
-#   ./run_led.sh ping red -> Envia Ping Vermelho
+# LED Vibe Engine - Wrapper de controle
+# Uso:
+#   run_led.sh              -> Inicia o daemon (Vibe Engine)
+#   run_led.sh blue         -> Envia ping azul
+#   run_led.sh ping red     -> Envia ping vermelho
+#   run_led.sh mode ROCK    -> Muda modo para ROCK
 
-BASE_DIR="/var/home/bruno/silverblue-led-controller"
+BASE_DIR="$SCRIPT_DIR"
 
 if [ -n "\$1" ]; then
     if [ "\$1" == "ping" ]; then
         COLOR="\${2:-green}"
+        "\$BASE_DIR/.venv/bin/python3" "\$BASE_DIR/led_ping_client.py" "\$COLOR"
+    elif [ "\$1" == "mode" ]; then
+        MODE="\${2:-JAZZ}"
+        "\$BASE_DIR/.venv/bin/python3" "\$BASE_DIR/led_ping_client.py" mode "\$MODE"
     else
-        COLOR="\$1"
+        "\$BASE_DIR/.venv/bin/python3" "\$BASE_DIR/led_ping_client.py" "\$1"
     fi
-    python3 "\$BASE_DIR/led_ping_client.py" "\$COLOR"
 else
-    "\$BASE_DIR/run_audio_sync.sh"
+    "\$BASE_DIR/.venv/bin/python3" "\$BASE_DIR/audio_sync.py"
 fi
 EOF
 chmod +x "$HOME/.script/run_led.sh"
 
-# 4. Systemd Service
-echo -e "${BLUE}⚙️  Configurando Systemd User Service...${NC}"
+# 5. Systemd Service
+echo -e "${BLUE}⚙️  Instalando serviço systemd '${SERVICE_NAME}'...${NC}"
 mkdir -p "$HOME/.config/systemd/user"
-cat > "$HOME/.config/systemd/user/silverblue-led-vibe.service" <<EOF
+cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Silverblue LED Controller (Vibe Engine)
-After=sound.target
+Description=LED Vibe Engine
+After=bluetooth.target sound.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=$HOME/silverblue-led-controller/run_audio_sync.sh
+ExecStart=${VENV_PYTHON} ${SCRIPT_DIR}/audio_sync.py
 Restart=always
 RestartSec=5
-StandardOutput=null
+StandardOutput=journal
 StandardError=journal
 
 [Install]
@@ -74,11 +101,14 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable silverblue-led-vibe.service
-echo -e "${GREEN}✅ Serviço habilitado (inicia no boot).${NC}"
-echo -e "Para iniciar agora: systemctl --user start silverblue-led-vibe.service"
+systemctl --user enable "${SERVICE_NAME}.service"
+systemctl --user restart "${SERVICE_NAME}.service"
 
-echo -e "${GREEN}✅ Instalação Concluída!${NC}"
+echo ""
+echo -e "${GREEN}✅ LED Vibe Engine instalado e iniciado!${NC}"
+echo ""
 echo -e "Comandos úteis:"
-echo -e "  ~/.script/run_led.sh blue   (Testar Ping)"
-echo -e "  ~/.script/run_led.sh        (Rodar manual)"
+echo -e "  systemctl --user status ${SERVICE_NAME}"
+echo -e "  journalctl --user -fu ${SERVICE_NAME}"
+echo -e "  ~/.script/run_led.sh blue      (ping azul)"
+echo -e "  ~/.script/run_led.sh mode ROCK (modo ROCK)"

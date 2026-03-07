@@ -1,0 +1,15 @@
+[Unit]
+Description=LED Vibe Engine
+After=bluetooth.target sound.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/led-vibe-engine/.venv/bin/python3 %h/led-vibe-engine/audio_sync.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
