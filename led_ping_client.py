@@ -16,14 +16,14 @@ async def send_ping(cmd_arg="green", extra_arg="LED Ping Enviado"):
             extra_arg if not cmd_arg.upper() == "MODE" else f"Alterando modo para {extra_arg}", 
             f"Comando: {cmd_arg.upper()}"
         ])
-    except Exception as e:
-        print(f"⚠️ Falha ao notificar: {e}")
+    except Exception:
+        pass
 
     # Enviar Comando Socket
     try:
         reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
         
-        # Lista estendida de modos suportados
+        # Lista de modos suportados
         modes = ["STATIC", "DYNAMIC", "WARM_COLD", "VAPORWAVE", "WAR_ZONE", "ROCK", "JAZZ", "TECHNO", "LOFI", "KCD2", "GTA4"]
         
         if cmd_arg.upper() == "MODE" and extra_arg.upper() in modes:
@@ -41,8 +41,6 @@ async def send_ping(cmd_arg="green", extra_arg="LED Ping Enviado"):
         writer.close()
         await writer.wait_closed()
         print(f"✅ Comando enviado: {message}")
-    except FileNotFoundError:
-        print("❌ Serviço LED não está rodando (Socket não encontrado).")
     except Exception as e:
         print(f"❌ Erro ao conectar: {e}")
 
