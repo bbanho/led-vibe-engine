@@ -221,9 +221,11 @@ class AudioReactive:
                     self.led = LEDBLE(device); await self.led.connect()
                     target_id = None; devices = sd.query_devices()
                     for i, d in enumerate(devices):
-                        # Mudança crítica: Procura por "Easy Effects Sink" ou "easyeffects_sink"
                         name = d['name'].lower()
-                        if "easy effects" in name or "easyeffects" in name: target_id = i; break
+                        # Procura por Monitor de Hardware (ex: Analog Stereo Monitor), ignorando EasyEffects
+                        if "monitor" in name and "easyeffects" not in name: 
+                            target_id = i; break
+                    
                     if target_id is None: target_id = sd.default.device[0]
                     with sd.InputStream(callback=lambda d,f,t,s: self.process_audio(d), device=target_id, channels=1, samplerate=SAMPLE_RATE):
                         await self.led_control_loop()
